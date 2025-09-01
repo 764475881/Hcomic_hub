@@ -11,6 +11,7 @@ from flask import Flask, jsonify, render_template_string, request, send_from_dir
 # --- 默认配置 ---
 DEFAULT_CONFIG = {
     "target_tag_groups": [
+        ["chinese", "loli"],
         ["chinese", "dick girl"]
     ],
     "download_path": "comics",
@@ -22,7 +23,12 @@ DEFAULT_CONFIG = {
 }
 
 # --- 全局变量 ---
-DATA_DIR = "/data"
+# 智能处理数据目录，兼容 Docker 和本地运行
+if os.path.isdir("/data") and os.access("/data", os.W_OK):
+    DATA_DIR = "/data"
+else:
+    DATA_DIR = "data"
+
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 METADATA_FILE = os.path.join(DATA_DIR, "library_metadata.json")
 app_config = {}
@@ -32,13 +38,18 @@ HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
 }
 KNOWN_LANGUAGES = ["chinese", "english", "japanese", "translated"]
-# --- 任务控制 ---
-downloader_lock = threading.Lock()
+# --- 任务控制 (使用 RLock 修复死锁问题) ---
+downloader_lock = threading.RLock()
 stop_event = threading.Event()
 
 
 # --- 日志配置 ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# 屏蔽 Flask 的常规请求日志
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
+# 在启动时打印数据目录位置
+logging.info(f"数据目录设置为: {os.path.abspath(DATA_DIR)}")
 
 # --- 配置与元数据管理 ---
 def load_data():
@@ -77,7 +88,6 @@ def save_config():
 
 def save_metadata():
     """保存元数据"""
-    # 使用线程锁确保文件写入安全
     with downloader_lock:
         with open(METADATA_FILE, 'w', encoding='utf-8') as f:
             json.dump(library_metadata, f, indent=4)
@@ -131,13 +141,20 @@ def fetch_and_save_metadata(comic_id, session):
         title = title_element.find('span', class_='pretty').text
 
         all_tags = {}
-        tag_sections = soup.find_all('div', class_='tag-container')
-        for section in tag_sections:
-            section_name_element = section.find('h3')
-            if not section_name_element: continue
-            section_name = section_name_element.text.strip().replace(':', '')
-            tags = [a.find('span', class_='name').text for a in section.find_all('a', class_='tag')]
-            if tags: all_tags[section_name] = tags
+        tags_section = soup.find('section', id='tags')
+        if tags_section:
+            tag_containers = tags_section.find_all('div', class_='tag-container')
+            for container in tag_containers:
+                category_name = ""
+                for content in container.contents:
+                    if isinstance(content, str) and content.strip():
+                        category_name = content.strip().replace(':', '')
+                        break
+
+                if category_name:
+                    tags = [tag.find('span', class_='name').text for tag in container.select('span.tags a.tag')]
+                    if tags:
+                        all_tags[category_name] = tags
 
         comic_id_str = str(comic_id)
         if comic_id_str not in library_metadata: library_metadata[comic_id_str] = {}
@@ -154,12 +171,10 @@ def download_comic(comic_id, session):
     """下载单本漫画，并响应停止事件"""
     if stop_event.is_set(): return None
 
-    # 1. 获取元数据
     if not fetch_and_save_metadata(comic_id, session):
         logging.error(f"无法获取漫画 {comic_id} 的元数据，跳过下载。")
         return None
 
-    # 2. 下载图片
     base_url = f"https://nhentai.net/g/{comic_id}/"
     logging.info(f"开始处理漫画: {base_url}")
     try:
@@ -319,12 +334,12 @@ def refresh_metadata_task():
             if stop_event.is_set(): logging.info("元数据刷新任务被手动停止。"); break
             try:
                 comic_id_str = folder.split('_')[0]
-                # 检查是否缺少 'tags' 键作为需要刷新的标志
-                if 'tags' not in library_metadata.get(comic_id_str, {}):
+                # If tags object is empty or doesn't exist, refresh it
+                if not library_metadata.get(comic_id_str, {}).get('tags'):
                     logging.info(f"发现缺少元数据的漫画: {comic_id_str}，正在刷新...")
                     if fetch_and_save_metadata(int(comic_id_str), session):
                         refreshed_count += 1
-                        time.sleep(1) # 避免请求过快
+                        time.sleep(1)
                     else:
                         logging.warning(f"刷新 {comic_id_str} 失败，将跳过。")
             except (ValueError, IndexError):
@@ -336,12 +351,16 @@ def refresh_metadata_task():
 
 
 def scheduled_downloader():
+    """定时调度器，先等待完整间隔时间，再执行任务"""
+    time.sleep(5)
     while True:
-        time.sleep(10)
-        run_downloader()
         check_interval = app_config.get("check_interval_hours", 24)
-        logging.info(f"任务完成，将在 {check_interval} 小时后再次运行。")
+        logging.info(f"定时任务休眠中，下一次自动扫描将在约 {check_interval} 小时后运行。")
         time.sleep(check_interval * 3600)
+
+        logging.info("定时任务启动，开始自动扫描...")
+        run_downloader()
+
 
 # --- 前端网页服务 (Flask) ---
 app = Flask(__name__)
@@ -373,7 +392,7 @@ h1,h2{color:var(--accent-color);border-bottom:2px solid var(--border-color);padd
 .comic-item.hidden{display:none}
 .comic-item:hover{transform:translateY(-5px);box-shadow:0 8px 16px rgba(0,0,0,.3)}
 .comic-item a{text-decoration:none;color:var(--text-color);display:block}
-.comic-item img{width:100%;height:250px;object-fit:cover;display:block}
+.comic-item img{width:100%;aspect-ratio:2/3;object-fit:cover;background-color:#1a1a1c}
 .comic-item .title{padding:10px 10px 30px;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .comic-actions{position:absolute;bottom:5px;right:5px;display:flex;gap:5px}
 .action-btn{background:rgba(0,0,0,.6);border:none;color:#fff;cursor:pointer;padding:5px;border-radius:50%;width:28px;height:28px;display:flex;align-items:center;justify-content:center}
@@ -424,7 +443,7 @@ INDEX_HTML = f"""
                     <input type="text" id="proxy-editor" placeholder="HTTP/HTTPS Proxy">
                 </div>
                 <div class="form-group">
-                    <label for="download-path-editor">下载路径 (容器内路径)</label>
+                    <label for="download-path-editor">下载路径 (保存于 data 目录内)</label>
                     <input type="text" id="download-path-editor" placeholder="例如: comics">
                 </div>
                 <div class="button-group">
@@ -572,7 +591,10 @@ INDEX_HTML = f"""
         // --- 事件监听与状态管理 ---
         function setupEventListeners() {{
             setInterval(() => {{
-                fetch('/api/downloader_status').then(r => r.json()).then(data => {{
+                fetch('/api/downloader_status').then(r => {{
+                    if (!r.ok) {{ throw new Error("Network response was not ok"); }}
+                    return r.json();
+                }}).then(data => {{
                     const isRunning = data.running;
                     const failedCount = data.failed_count || 0;
                     
@@ -585,6 +607,8 @@ INDEX_HTML = f"""
                     
                     if(failedCount > 0) {{ retryBtn.style.display='inline-block'; retryBtn.textContent=`重试失败 (${{failedCount}})`; retryBtn.disabled = isRunning; }}
                     else {{ retryBtn.style.display='none'; }}
+                }}).catch(error => {{
+                    console.error("Error fetching status:", error);
                 }});
             }}, 2000);
 
@@ -713,7 +737,7 @@ INDEX_HTML = f"""
             proxyEditor.value = config.proxies ? (config.proxies.http || '') : '';
             const basePath = "/data/";
             let displayPath = config.download_path || 'comics';
-            if (displayPath.startsWith(basePath)) {{ displayPath = displayPath.substring(basePath.length); }}
+            if (displayPath.startsWith(basePath)) {{ displayPath = display_path.substring(basePath.length); }}
             downloadPathEditor.value = displayPath;
         }});
     }});
@@ -850,16 +874,23 @@ def handle_config():
         config_copy["download_path"] = display_path
         return jsonify(config_copy)
 
+def is_downloader_running():
+    """Helper to check RLock status correctly."""
+    was_free = downloader_lock.acquire(blocking=False)
+    if was_free:
+        downloader_lock.release()
+    return not was_free
+
 @app.route('/api/downloader_status', methods=['GET'])
 def downloader_status():
     return jsonify({
-        "running": downloader_lock.locked(),
+        "running": is_downloader_running(),
         "failed_count": len(library_metadata.get('failed_ids', []))
     })
 
 @app.route('/api/run_downloader', methods=['POST'])
 def trigger_downloader():
-    if downloader_lock.locked():
+    if is_downloader_running():
         return jsonify({"status": "error", "message": "下载任务已在运行中"}), 409
 
     manual_run_thread = threading.Thread(target=run_downloader)
@@ -868,7 +899,7 @@ def trigger_downloader():
 
 @app.route('/api/stop_downloader', methods=['POST'])
 def stop_downloader():
-    if not downloader_lock.locked():
+    if not is_downloader_running():
         return jsonify({"status": "error", "message": "当前没有下载任务在运行"}), 409
 
     stop_event.set()
@@ -877,7 +908,7 @@ def stop_downloader():
 
 @app.route('/api/retry_failed', methods=['POST'])
 def trigger_retry():
-    if downloader_lock.locked():
+    if is_downloader_running():
         return jsonify({"status": "error", "message": "下载任务已在运行中"}), 409
 
     retry_thread = threading.Thread(target=retry_failed_downloads)
@@ -886,7 +917,7 @@ def trigger_retry():
 
 @app.route('/api/refresh_metadata', methods=['POST'])
 def trigger_refresh_metadata():
-    if downloader_lock.locked():
+    if is_downloader_running():
         return jsonify({"status": "error", "message": "已有任务在运行"}), 409
 
     refresh_thread = threading.Thread(target=refresh_metadata_task)
@@ -1002,4 +1033,5 @@ if __name__ == '__main__':
     logging.info("启动本地网页服务器...")
     logging.info("请在浏览器中打开 http://127.0.0.1:5000 来访问您的漫画库。")
     app.run(host='0.0.0.0', port=5000, debug=False)
+
 
